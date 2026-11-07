@@ -118,10 +118,19 @@
   - 设备: `Treadmill_R`, `Treadmill_L`, `FP1`, `FP2`, `FP5`, `FP6`, `Combined`
   - 量: `vx/vy/vz` (力), `px/py/pz` (位置), `moment_x/moment_y/moment_z` (力矩)
 
-### gcLeft / gcRight (步态周期事件)
+### gcLeft / gcRight (步态周期相位)
 - **列数**: 3 (Header, HeelStrike, ToeOff)
-- **行数**: 3068
-- **说明**: 记录每一步的脚跟着地 (HeelStrike) 和脚趾离地 (ToeOff) 事件时间
+- **行数**: 与同 trial 的 `imu/` 相同 (200 Hz, 例如 3068)
+- **说明**: **不是事件时间戳**。`HeelStrike` / `ToeOff` 各是一条 0→100 的锯齿相位斜坡：
+  事件发生的那一刻值瞬间从 100 跳回 0，然后沿**行索引**线性升到 100.0。
+  - `HeelStrike` 是**该文件所属那条腿**的跟地事件，`ToeOff` 同理是该腿的离地事件。
+    例外：**跑步机上 `gcLeft.ToeOff` 与 `gcRight.ToeOff` 逐字节相同**（两份都是右脚离地），
+    地面条件上两者相差约半个周期（左右交替）。
+  - 事件下标 = 斜坡「离开零点」的那一拍：
+    `s = np.where((v[:-1]==0.0) & (v[1:]>0.0))[0]`，事件时刻 = `Header[s]`。
+    **不要用 `np.diff(v) < 0`** —— 文件开头有一段字面 0，那样会漏掉每列的第一个事件。
+  - 站立/静止段里斜坡被拉长（平地行走的第一个跟地-跟地间隔可达 4.4 s），那不是真实的步态周期。
+  - 详见 [`project_struc/gait_cycle_view.md`](project_struc/gait_cycle_view.md)。
 
 ### gon (量角器关节角度)
 - **列数**: 6
@@ -200,6 +209,17 @@ print(ik.shape)     # (3068, 24)
 
 # 同一 trial 的不同数据类型可通过文件名对应
 # 例如: levelground_ccw_fast_01_01 在 emg/ik/imu/... 中都有同名文件
+
+# 提取步态周期事件 (HeelStrike / ToeOff 是相位斜坡, 不是时间戳)
+import numpy as np
+gc = pd.read_csv('levelground/gcRight/levelground_ccw_fast_01_01.csv')
+
+def events(v):
+    """斜坡「离开零点」的那一拍才是事件 (不能用 np.diff(v) < 0)。"""
+    return np.where((v[:-1] == 0.0) & (v[1:] > 0.0))[0]
+
+hs = gc['Header'].values[events(gc['HeelStrike'].values)]   # 右脚跟触时刻
+to = gc['Header'].values[events(gc['ToeOff'].values)]       # 右脚离地时刻
 ```
 
 ### 同一 trial 的数据对齐

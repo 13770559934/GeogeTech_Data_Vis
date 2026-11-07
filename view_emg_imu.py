@@ -1,39 +1,43 @@
 """
-AB06 数据集 EMG + IMU 可视化工具
+Georgia Tech 数据集 EMG + IMU 可视化工具
 
 使用 PySide6 + pyqtgraph，支持：
-  - 按 4 种运动条件 (levelground/ramp/stair/treadmill) 选择 trial
+  - 选择受试者 (AB06 … AB28) 与运动条件 (levelground/ramp/stair/treadmill)
   - 上图: EMG 多通道叠加，左侧树勾选显隐
-  - 下图: IMU 单通道，下拉选择
+  - 中图: IMU 单通道，下拉选择
+  - 下图: 右脚步态周期 (gcRight) 的原始锯齿斜坡
+  - EMG / IMU 两个面板叠加步态事件竖线与支撑相色带
   - X 轴联动，鼠标滚轮缩放、拖拽平移
+
+命令行:
+    uv run python view_emg_imu.py
+    uv run python view_emg_imu.py --subject AB12 --condition ramp
+    uv run python view_emg_imu.py --data-dir D:\\path\\to\\data_GeorgiaTech_csv
 """
 
 import sys
-import os
+import argparse
 import colorsys
-from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QLabel, QSplitter, QTreeWidget, QTreeWidgetItem,
-    QAbstractItemView, QPushButton,
+    QAbstractItemView, QPushButton, QCheckBox, QGroupBox,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 
-# ── 常量 ──────────────────────────────────────────────
-DATA_DIR = Path(__file__).parent
+from gt_dataset import (
+    CONDITION_LABELS, Dataset, add_data_args, resolve_dataset,
+)
+from gt_gait import (
+    GC_SENSOR, HS_COLOR, TO_COLOR, STANCE_COLOR,
+    GaitEvents, GaitOverlay, extract_events, load_walk_mask,
+)
 
-CONDITIONS = ["levelground", "ramp", "stair", "treadmill"]
-
-CONDITION_LABELS = {
-    "levelground": "平地行走",
-    "ramp": "坡道行走",
-    "stair": "楼梯行走",
-    "treadmill": "跑步机行走",
-}
 
 # 11 个 EMG 通道的缩写+中文名
 EMG_LABELS = {
@@ -81,6 +85,16 @@ def setup_curve(curve):
     return curve
 
 
+def color_swatch(color: str, text: str) -> QLabel:
+    """侧栏图例的小色块 (HS 跟触 / TO 离地 / 支撑相)。"""
+    label = QLabel(f" {text} ")
+    label.setStyleSheet(
+        f"background-color: {color}; color: #ffffff;"
+        f" border-radius: 3px; padding: 1px 5px;")
+    label.setToolTip(f"{text}  ({color})")
+    return label
+
+
 def imu_label(ch: str) -> str:
     """生成 IMU 通道的友好标签，如 'foot_Accel_X' → '足部 加速度 X'。"""
     parts = ch.split("_")
@@ -97,16 +111,32 @@ def imu_label(ch: str) -> str:
 class EMGIMUViewer(QMainWindow):
     """EMG + IMU 可视化主窗口"""
 
-    def __init__(self):
+    #: 本视图依赖的传感器；trial 列表只列出 emg 与 imu 都存在的文件
+    REQUIRED_SENSORS = ("emg", "imu")
+
+    def __init__(self, dataset: Dataset, subject: str | None = None,
+                 condition: str | None = None, trial: str | None = None):
         super().__init__()
-        self.setWindowTitle("AB06 EMG / IMU 可视化")
-        self.resize(1400, 900)
+        self.dataset = dataset
+        self.resize(1400, 1000)
 
         self._emg_curves: list[pg.PlotDataItem] = []
         self._imu_df: pd.DataFrame | None = None
+        self._imu_curve: pg.PlotDataItem | None = None
+
+        # 步态周期 (gcRight) 相关状态
+        self._t0: float = 0.0              # 三个面板统一的时间零点 (EMG 起始)
+        self._gc_df: pd.DataFrame | None = None       # gcRight 原始表
+        self._gc_events: GaitEvents | None = None     # 提取出的事件
+        self._gc_walk_mask: np.ndarray | None = None   # 「算不算在走」的行级掩码
+        # 一个叠加层实例只服务一个面板 —— pyqtgraph 的图元只能存在于一个场景里
+        self._gc_overlay_emg = GaitOverlay()
+        self._gc_overlay_imu = GaitOverlay()
 
         self._build_ui()
-        self._load_trials()
+        self._populate_subjects(subject)
+        self._reload_conditions(condition)
+        self._load_trials(trial)
 
     # ── UI 构建 ──────────────────────────────────────
     def _build_ui(self):
@@ -116,10 +146,13 @@ class EMGIMUViewer(QMainWindow):
 
         # 顶部控制栏
         bar = QHBoxLayout()
+        bar.addWidget(QLabel("受试者:"))
+        self.cmb_subject = QComboBox()
+        self.cmb_subject.currentIndexChanged.connect(self._on_subject_changed)
+        bar.addWidget(self.cmb_subject)
+
         bar.addWidget(QLabel("条件:"))
         self.cmb_cond = QComboBox()
-        for c in CONDITIONS:
-            self.cmb_cond.addItem(f"{CONDITION_LABELS[c]} ({c})", c)
         self.cmb_cond.currentIndexChanged.connect(self._on_cond_changed)
         bar.addWidget(self.cmb_cond)
 
@@ -162,10 +195,13 @@ class EMGIMUViewer(QMainWindow):
         self.cmb_imu.currentIndexChanged.connect(self._on_imu_changed)
         sb_layout.addWidget(self.cmb_imu)
 
+        sb_layout.addSpacing(10)
+        sb_layout.addWidget(self._build_gc_box())
+
         sb_layout.addStretch()
         splitter.addWidget(sidebar)
 
-        # 右: 上下双图
+        # 右: 三图 (EMG / IMU / 步态周期)
         pg.setConfigOptions(antialias=ANTIALIAS)
         plot_splitter = QSplitter(Qt.Vertical)
 
@@ -177,7 +213,7 @@ class EMGIMUViewer(QMainWindow):
         self.plot_emg.showGrid(x=True, y=True, alpha=0.3)
         plot_splitter.addWidget(self.plot_emg)
 
-        # 下图: IMU (白色背景)
+        # 中图: IMU (白色背景)
         self.plot_imu = pg.PlotWidget()
         self.plot_imu.setBackground("w")
         self.plot_imu.getAxis("left").enableAutoSIPrefix(False)
@@ -186,45 +222,199 @@ class EMGIMUViewer(QMainWindow):
         self.plot_imu.showGrid(x=True, y=True, alpha=0.3)
         plot_splitter.addWidget(self.plot_imu)
 
-        # X 轴联动
-        self.plot_imu.setXLink(self.plot_emg)
+        # 下图: 右脚步态周期 (gcRight 的原始锯齿斜坡)
+        self.plot_gc = pg.PlotWidget()
+        self.plot_gc.setBackground("w")
+        self.plot_gc.getAxis("left").enableAutoSIPrefix(False)
+        self.plot_gc.setLabel("left", "周期相位 (%)")
+        self.plot_gc.showGrid(x=True, y=True, alpha=0.3)
+        # 图例排成一行 —— GC 面板很矮, 竖排两行会盖住斜坡
+        self.plot_gc.addLegend(offset=(10, 8), labelTextSize="9pt")
+        self.plot_gc.plotItem.legend.setColumnCount(2)
+        plot_splitter.addWidget(self.plot_gc)
 
-        plot_splitter.setSizes([450, 450])
+        # X 轴联动 (EMG 面板是主控方)
+        self.plot_imu.setXLink(self.plot_emg)
+        self.plot_gc.setXLink(self.plot_emg)
+
+        plot_splitter.setSizes([360, 300, 190])
         splitter.addWidget(plot_splitter)
 
         splitter.setSizes([250, 1150])
         root.addWidget(splitter)
 
+    # ── 步态周期 (GC) 控件 ──────────────────────────
+    def _build_gc_box(self) -> QGroupBox:
+        """侧栏的步态周期控制组。"""
+        box = QGroupBox(f"步态周期 ({GC_SENSOR})")
+        self.gc_box = box
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(8, 4, 8, 8)
+
+        # 图例: 三个色块
+        legend = QHBoxLayout()
+        legend.addWidget(color_swatch(HS_COLOR, "HS 跟触"))
+        legend.addWidget(color_swatch(TO_COLOR, "TO 离地"))
+        legend.addWidget(color_swatch(STANCE_COLOR, "支撑相"))
+        legend.addStretch()
+        lay.addLayout(legend)
+
+        self.chk_gc_lines = QCheckBox("事件竖线 (HS / TO)")
+        self.chk_gc_lines.setChecked(True)
+        self.chk_gc_lines.toggled.connect(
+            lambda _checked: self._apply_gc_visibility())
+        lay.addWidget(self.chk_gc_lines)
+
+        self.chk_gc_ribbon = QCheckBox("支撑相色带")
+        self.chk_gc_ribbon.setChecked(True)
+        self.chk_gc_ribbon.toggled.connect(
+            lambda _checked: self._apply_gc_visibility())
+        lay.addWidget(self.chk_gc_ribbon)
+
+        self.chk_gc_walk_only = QCheckBox("仅显示步行段")
+        self.chk_gc_walk_only.setToolTip(
+            "按 conditions/Label 过滤掉 idle / stand 段里的伪事件\n"
+            "(跑台的 conditions 只有 Speed 列, 没有 Label, 不可用)")
+        self.chk_gc_walk_only.toggled.connect(
+            lambda _checked: self._rebuild_gait())
+        lay.addWidget(self.chk_gc_walk_only)
+
+        return box
+
+    def _apply_gc_visibility(self):
+        """显隐开关 → 直接改图元可见性 (不重建)。"""
+        for overlay in (self._gc_overlay_emg, self._gc_overlay_imu):
+            overlay.set_visible(
+                ribbon=self.chk_gc_ribbon.isChecked(),
+                hs=self.chk_gc_lines.isChecked(),
+                to=self.chk_gc_lines.isChecked(),
+            )
+
+    def _rebuild_gait(self):
+        """按当前开关重新提取步态事件并刷新叠加层。
+
+        「仅显示步行段」会改变事件集合, 所以要重建; 显隐开关只改可见性。
+        """
+        events = None
+        if self._gc_df is not None:
+            keep = self._gc_walk_mask if self.chk_gc_walk_only.isChecked() else None
+            events = extract_events(self._gc_df, self._t0, keep=keep)
+        self._gc_events = events
+
+        for overlay in (self._gc_overlay_emg, self._gc_overlay_imu):
+            overlay.build(events)
+        self._gc_overlay_emg.attach(self.plot_emg)
+        self._gc_overlay_imu.attach(self.plot_imu)
+        self._apply_gc_visibility()
+        self._update_gc_controls()
+
+    def _update_gc_controls(self):
+        """按可用性置灰控件。"""
+        has_gc = self._gc_df is not None
+        has_events = self._gc_events is not None and not self._gc_events.is_empty
+        self.chk_gc_lines.setEnabled(has_events)
+        self.chk_gc_ribbon.setEnabled(has_events)
+        # 「仅显示步行段」需要 conditions/Label —— 跑台的 conditions 只有 Speed
+        self.chk_gc_walk_only.setEnabled(has_gc and self._gc_walk_mask is not None)
+        self.gc_box.setEnabled(has_gc)
+        if has_gc:
+            self.gc_box.setTitle(f"步态周期 ({GC_SENSOR})")
+        else:
+            self.gc_box.setTitle(f"步态周期 ({GC_SENSOR}) — 本 trial 无此文件")
+
+    def _gc_info_text(self) -> str:
+        """状态栏里的 gcRight 摘要。"""
+        if self._gc_df is None:
+            return "  |  gcRight: 无"
+        events = self._gc_events
+        if events is None or events.is_empty:
+            return "  |  gcRight: 无事件"
+        return (f"  |  gcRight: {len(events)} 步 "
+                f"(HS {events.t_hs.size} / TO {events.t_to.size})")
+
     # ── 数据加载 ──────────────────────────────────────
-    def _load_trials(self):
-        """加载当前条件下的 trial 列表 (只列出 EMG 和 IMU 同时存在的)"""
+    def _populate_subjects(self, preselect: str | None = None):
+        """填充受试者下拉框（数据来自数据集扫描，转换中新出现的受试者也能看到）"""
+        self.cmb_subject.blockSignals(True)
+        self.cmb_subject.clear()
+        for subject in self.dataset.subjects:
+            self.cmb_subject.addItem(subject, subject)
+
+        if preselect:
+            idx = self._find_subject(preselect)
+            if idx >= 0:
+                self.cmb_subject.setCurrentIndex(idx)
+        self.cmb_subject.blockSignals(False)
+        self._update_title()
+
+    def _find_subject(self, name: str) -> int:
+        """按名字找受试者下标，大小写不敏感；找不到返回 -1"""
+        for i in range(self.cmb_subject.count()):
+            if self.cmb_subject.itemData(i).upper() == name.upper():
+                return i
+        return -1
+
+    def _reload_conditions(self, preselect: str | None = None):
+        """按当前受试者刷新运动条件下拉框"""
+        subject = self.cmb_subject.currentData()
+        prev = self.cmb_cond.currentData()
+
+        conds = self.dataset.conditions_for(subject, *self.REQUIRED_SENSORS)
+
+        self.cmb_cond.blockSignals(True)
+        self.cmb_cond.clear()
+        for c in conds:
+            self.cmb_cond.addItem(f"{CONDITION_LABELS[c]} ({c})", c)
+
+        # 优先用命令行指定的，否则尽量保持用户当前选中的条件
+        target = preselect if preselect in conds else prev
+        if target in conds:
+            self.cmb_cond.setCurrentIndex(conds.index(target))
+        self.cmb_cond.blockSignals(False)
+
+    def _load_trials(self, preselect: str | None = None):
+        """加载当前受试者 + 条件下的 trial 列表 (只列出 EMG 和 IMU 同时存在的)"""
+        subject = self.cmb_subject.currentData()
+        cond = self.cmb_cond.currentData()
+
         self.cmb_trial.blockSignals(True)
         self.cmb_trial.clear()
 
-        cond = self.cmb_cond.currentData()
-        emg_dir = DATA_DIR / cond / "emg"
-        imu_dir = DATA_DIR / cond / "imu"
-        if emg_dir.is_dir():
-            files = sorted(f for f in os.listdir(emg_dir) if f.endswith(".csv"))
-            for f in files:
-                if imu_dir.is_dir() and (imu_dir / f).exists():
-                    self.cmb_trial.addItem(f.replace(".csv", ""), f)
+        for fname in self.dataset.trials(subject, cond, *self.REQUIRED_SENSORS):
+            self.cmb_trial.addItem(fname.replace(".csv", ""), fname)
+
+        if preselect:
+            target = preselect if preselect.endswith(".csv") else preselect + ".csv"
+            idx = self.cmb_trial.findData(target)
+            if idx >= 0:
+                self.cmb_trial.setCurrentIndex(idx)
 
         self.cmb_trial.blockSignals(False)
         if self.cmb_trial.count() > 0:
             self._on_trial_changed()
 
+    def _update_title(self):
+        subject = self.cmb_subject.currentData() or "—"
+        self.setWindowTitle(f"{subject} EMG / IMU 可视化")
+
+    # ── 交互回调 ──────────────────────────────────────
+    def _on_subject_changed(self):
+        self._update_title()
+        self._reload_conditions()
+        self._load_trials()
+
     def _on_cond_changed(self):
         self._load_trials()
 
     def _on_trial_changed(self):
+        subject = self.cmb_subject.currentData()
         cond = self.cmb_cond.currentData()
         fname = self.cmb_trial.currentData()
-        if not cond or not fname:
+        if not subject or not cond or not fname:
             return
 
-        emg_path = DATA_DIR / cond / "emg" / fname
-        imu_path = DATA_DIR / cond / "imu" / fname
+        emg_path = self.dataset.trial_path(subject, cond, "emg", fname)
+        imu_path = self.dataset.trial_path(subject, cond, "imu", fname)
         if not emg_path.exists():
             return
 
@@ -234,28 +424,56 @@ class EMGIMUViewer(QMainWindow):
         emg_df = pd.read_csv(emg_path)
         imu_df = pd.read_csv(imu_path) if imu_path.exists() else None
 
+        # 步态周期是「可选加载」: 没有 gcRight 就降级, 绝不影响 trial 列表
+        # (旧布局的 treadmill/gcRight 少一个文件, 所以不能进 REQUIRED_SENSORS)
+        self._gc_df = None
+        self._gc_walk_mask = None
+        gc_path = self.dataset.trial_path(subject, cond, GC_SENSOR, fname)
+        if gc_path.exists():
+            try:
+                self._gc_df = pd.read_csv(gc_path)
+            except Exception:
+                self._gc_df = None          # 转换中写了一半 —— 当作没有
+
+        # conditions/Label 用于「仅显示步行段」过滤 (跑台没有 Label, 会是 None)
+        cond_path = self.dataset.trial_path(subject, cond, "conditions", fname)
+        if cond_path.exists() and self._gc_df is not None:
+            try:
+                self._gc_walk_mask = load_walk_mask(
+                    pd.read_csv(cond_path),
+                    self._gc_df["Header"].to_numpy(dtype=float))
+            except Exception:
+                self._gc_walk_mask = None
+
         self._plot(emg_df, imu_df)
 
         imu_info = f"  |  IMU {len(imu_df)} 行" if imu_df is not None else "  |  IMU: 无"
         self.statusBar().showMessage(
-            f"{emg_path.name}  |  EMG {len(emg_df)} 行  |  {len(emg_df.columns) - 1} 通道{imu_info}"
+            f"{emg_path.name}  |  EMG {len(emg_df)} 行  |  "
+            f"{len(emg_df.columns) - 1} 通道{imu_info}{self._gc_info_text()}"
         )
 
     # ── 绘图 ──────────────────────────────────────────
     def _plot(self, emg_df: pd.DataFrame, imu_df: pd.DataFrame | None):
-        """绘制 EMG 各通道 + IMU 通道下拉"""
+        """绘制 EMG 各通道 + IMU 通道下拉 + 步态周期叠加层"""
         # 清除旧曲线
         self.plot_emg.clear()
         self._emg_curves.clear()
 
+        # 步态叠加层要先摘, 再清面板 —— 顺序反了 attach() 的幂等判断会失准
+        self._gc_overlay_emg.detach()
+        self._gc_overlay_imu.detach()
+
         self.plot_imu.clear()
+        self._imu_curve = None
 
         # 清除旧树
         self.tree.blockSignals(True)
         self.tree.clear()
 
-        # 公共时间零点 (EMG 起始)
-        t0 = emg_df["Header"].values[0]
+        # 公共时间零点 (EMG 起始) —— EMG 面板是 X 轴主控方, 三个面板统一用它。
+        # (跑台 trial 的 imu.t0 与 emg.t0 最多差 4 ms, 各自归零会让两图错位)
+        self._t0 = t0 = emg_df["Header"].values[0]
 
         # ── EMG ──
         t_emg = emg_df["Header"].values - t0
@@ -295,13 +513,25 @@ class EMGIMUViewer(QMainWindow):
                 self.cmb_imu.addItem(imu_label(ch), ch)
             self.cmb_imu.setCurrentIndex(0)
         self.cmb_imu.blockSignals(False)
+
+        # ── 步态周期 ──
+        # 先重建叠加层 (事件集), 再画 IMU 曲线 —— 顺序反了会把上一条 trial 的
+        # 旧图元先挂上去再换掉
+        self._rebuild_gait()
         self._plot_imu()
+        self._plot_gc()
 
         self.plot_emg.autoRange()
 
     def _plot_imu(self):
         pw = self.plot_imu
-        pw.clear()
+        # 只摘掉上一条 IMU 曲线; 步态叠加层留着 —— 切通道时不必重建几百个图元
+        if self._imu_curve is not None:
+            pw.getPlotItem().removeItem(self._imu_curve)
+            self._imu_curve = None
+        # 叠加层挂回面板 (幂等)
+        self._gc_overlay_imu.attach(pw)
+
         if self._imu_df is None:
             pw.setTitle("IMU — (无数据)", size="10pt")
             return
@@ -309,12 +539,52 @@ class EMGIMUViewer(QMainWindow):
         if i < 0:
             return
         ch = self.cmb_imu.itemData(i)
-        t0 = self._imu_df["Header"].values[0]
-        t = self._imu_df["Header"].values - t0
+        t = self._imu_df["Header"].values - self._t0
         y = self._imu_df[ch].values
-        curve = setup_curve(pw.plot(t, y, pen=pg.mkPen("#2ca02c", width=1)))
+        self._imu_curve = setup_curve(
+            pw.plot(t, y, pen=pg.mkPen("#2ca02c", width=1)))
         pw.setTitle(f"IMU — {imu_label(ch)}", size="10pt")
-        pw.autoRange()
+        self._auto_range_y(pw, y)
+
+    def _plot_gc(self):
+        """画 GC 面板: 两条原始锯齿斜坡 (数据原貌)。
+
+        锯齿的垂直跳变就是事件本身, 所以这个面板不需要再画竖线。
+        """
+        pw = self.plot_gc
+        pw.clear()
+        if self._gc_df is None:
+            pw.setTitle("步态周期 GC (右脚) — (无数据)", size="10pt")
+            return
+        t = self._gc_df["Header"].to_numpy(dtype=float) - self._t0
+        for col, color, style, name in (
+            ("HeelStrike", HS_COLOR, Qt.SolidLine, "跟触 HeelStrike"),
+            ("ToeOff", TO_COLOR, Qt.DashLine, "离地 ToeOff"),
+        ):
+            y = self._gc_df[col].to_numpy(dtype=float)
+            setup_curve(pw.plot(t, y, pen=pg.mkPen(color, width=1, style=style),
+                                name=name))
+        pw.setTitle("步态周期 GC (右脚) — 锯齿跳变处即事件", size="10pt")
+        # 不用 autoRange(): pyqtgraph 0.14 的 setXLink 是双向的, 在联动面板上调
+        # autoRange() 会把 X 范围推给所有面板, 用户的缩放会被重置。
+        pw.setYRange(-5, 105, padding=0)
+
+    @staticmethod
+    def _auto_range_y(pw: pg.PlotWidget, y: np.ndarray):
+        """只对 Y 轴自动定范围 (不动 X)。
+
+        pyqtgraph 0.14 没有 ``autoRange(axis="y")`` (``ViewBox.autoRange`` 的签名是
+        ``(padding, items, item)``), 而 ``setYRange(min, max)`` 的 min/max 又是必填的,
+        所以只能自己算范围。
+
+        不能直接用 ``pw.autoRange()``: 三个面板 X 轴联动, 而 0.14 的 ``setXLink``
+        是双向的 —— 任何一个面板重算 X 都会推给所有面板, 用户的缩放就没了。
+        """
+        ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
+        if not (np.isfinite(ymin) and np.isfinite(ymax)) or ymax <= ymin:
+            return
+        pad = 0.06 * (ymax - ymin)
+        pw.setYRange(ymin - pad, ymax + pad, padding=0)
 
     # ── 交互 ──────────────────────────────────────────
     def _on_item_changed(self, item: QTreeWidgetItem, col: int):
@@ -352,10 +622,17 @@ class EMGIMUViewer(QMainWindow):
             curve.setVisible(visible)
 
 
-def main():
-    app = QApplication(sys.argv)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Georgia Tech 数据集 EMG / IMU 可视化")
+    add_data_args(parser)
+    args = parser.parse_args(argv)
+
+    dataset = resolve_dataset(args)
+
+    app = QApplication(sys.argv[:1])
     app.setStyle("Fusion")
-    viewer = EMGIMUViewer()
+    viewer = EMGIMUViewer(dataset, subject=args.subject,
+                          condition=args.condition, trial=args.trial)
     viewer.show()
     sys.exit(app.exec())
 

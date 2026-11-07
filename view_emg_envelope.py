@@ -1,19 +1,22 @@
 """
-AB06 数据集 EMG 原始信号 + ISEK 包络 对比可视化
+Georgia Tech 数据集 EMG 原始信号 + ISEK 包络 对比可视化
 
 使用 PySide6 + pyqtgraph，支持：
-  - 按 4 种运动条件 (levelground/ramp/stair/treadmill) 选择 trial
+  - 选择受试者 (AB06 … AB28) 与运动条件 (levelground/ramp/stair/treadmill)
   - 上图: 原始 EMG 信号，下图: ISEK 包络信号
   - 11 通道叠加显示，左侧树勾选显隐（两图联动）
   - X 轴联动，鼠标滚轮缩放、拖拽平移
+
+命令行:
+    uv run python view_emg_envelope.py
+    uv run python view_emg_envelope.py --subject AB12 --condition ramp
+    uv run python view_emg_envelope.py --data-dir D:\\path\\to\\data_GeorgiaTech_csv
 """
 
 import sys
-import os
+import argparse
 import colorsys
-from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 from PySide6.QtWidgets import (
@@ -24,17 +27,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 
-# ── 常量 ──────────────────────────────────────────────
-DATA_DIR = Path(__file__).parent
-
-CONDITIONS = ["levelground", "ramp", "stair", "treadmill"]
-
-CONDITION_LABELS = {
-    "levelground": "平地行走",
-    "ramp": "坡道行走",
-    "stair": "楼梯行走",
-    "treadmill": "跑步机行走",
-}
+from gt_dataset import (
+    CONDITION_LABELS, Dataset, add_data_args, resolve_dataset,
+)
 
 # 11 个 EMG 通道的中文名
 EMG_LABELS = {
@@ -77,16 +72,23 @@ def setup_curve(curve):
 class EMGEnvelopeViewer(QMainWindow):
     """EMG 原始信号 + 包络 对比可视化主窗口"""
 
-    def __init__(self):
+    #: 本视图依赖的传感器；trial 列表只列出 emg 目录里存在的文件
+    #: （emg_envelope 是派生目录，缺失时下图留空）
+    REQUIRED_SENSORS = ("emg",)
+
+    def __init__(self, dataset: Dataset, subject: str | None = None,
+                 condition: str | None = None, trial: str | None = None):
         super().__init__()
-        self.setWindowTitle("AB06 EMG 原始信号 / ISEK 包络 对比")
+        self.dataset = dataset
         self.resize(1400, 900)
 
         self._raw_curves: list[pg.PlotDataItem] = []
         self._env_curves: list[pg.PlotDataItem] = []
 
         self._build_ui()
-        self._load_trials()
+        self._populate_subjects(subject)
+        self._reload_conditions(condition)
+        self._load_trials(trial)
 
     # ── UI 构建 ──────────────────────────────────────
     def _build_ui(self):
@@ -96,10 +98,13 @@ class EMGEnvelopeViewer(QMainWindow):
 
         # 顶部控制栏
         bar = QHBoxLayout()
+        bar.addWidget(QLabel("受试者:"))
+        self.cmb_subject = QComboBox()
+        self.cmb_subject.currentIndexChanged.connect(self._on_subject_changed)
+        bar.addWidget(self.cmb_subject)
+
         bar.addWidget(QLabel("条件:"))
         self.cmb_cond = QComboBox()
-        for c in CONDITIONS:
-            self.cmb_cond.addItem(f"{CONDITION_LABELS[c]} ({c})", c)
         self.cmb_cond.currentIndexChanged.connect(self._on_cond_changed)
         bar.addWidget(self.cmb_cond)
 
@@ -164,33 +169,88 @@ class EMGEnvelopeViewer(QMainWindow):
         root.addWidget(splitter)
 
     # ── 数据加载 ──────────────────────────────────────
-    def _load_trials(self):
-        """加载当前条件下的 trial 列表"""
+    def _populate_subjects(self, preselect: str | None = None):
+        """填充受试者下拉框（数据来自数据集扫描，转换中新出现的受试者也能看到）"""
+        self.cmb_subject.blockSignals(True)
+        self.cmb_subject.clear()
+        for subject in self.dataset.subjects:
+            self.cmb_subject.addItem(subject, subject)
+
+        if preselect:
+            idx = self._find_subject(preselect)
+            if idx >= 0:
+                self.cmb_subject.setCurrentIndex(idx)
+        self.cmb_subject.blockSignals(False)
+        self._update_title()
+
+    def _find_subject(self, name: str) -> int:
+        """按名字找受试者下标，大小写不敏感；找不到返回 -1"""
+        for i in range(self.cmb_subject.count()):
+            if self.cmb_subject.itemData(i).upper() == name.upper():
+                return i
+        return -1
+
+    def _reload_conditions(self, preselect: str | None = None):
+        """按当前受试者刷新运动条件下拉框"""
+        subject = self.cmb_subject.currentData()
+        prev = self.cmb_cond.currentData()
+
+        conds = self.dataset.conditions_for(subject, *self.REQUIRED_SENSORS)
+
+        self.cmb_cond.blockSignals(True)
+        self.cmb_cond.clear()
+        for c in conds:
+            self.cmb_cond.addItem(f"{CONDITION_LABELS[c]} ({c})", c)
+
+        # 优先用命令行指定的，否则尽量保持用户当前选中的条件
+        target = preselect if preselect in conds else prev
+        if target in conds:
+            self.cmb_cond.setCurrentIndex(conds.index(target))
+        self.cmb_cond.blockSignals(False)
+
+    def _load_trials(self, preselect: str | None = None):
+        """加载当前受试者 + 条件下的 trial 列表"""
+        subject = self.cmb_subject.currentData()
+        cond = self.cmb_cond.currentData()
+
         self.cmb_trial.blockSignals(True)
         self.cmb_trial.clear()
 
-        cond = self.cmb_cond.currentData()
-        emg_dir = DATA_DIR / cond / "emg"
-        if emg_dir.is_dir():
-            files = sorted([f for f in os.listdir(emg_dir) if f.endswith(".csv")])
-            for f in files:
-                self.cmb_trial.addItem(f.replace(".csv", ""), f)
+        for fname in self.dataset.trials(subject, cond, *self.REQUIRED_SENSORS):
+            self.cmb_trial.addItem(fname.replace(".csv", ""), fname)
+
+        if preselect:
+            target = preselect if preselect.endswith(".csv") else preselect + ".csv"
+            idx = self.cmb_trial.findData(target)
+            if idx >= 0:
+                self.cmb_trial.setCurrentIndex(idx)
 
         self.cmb_trial.blockSignals(False)
         if self.cmb_trial.count() > 0:
             self._on_trial_changed()
 
+    def _update_title(self):
+        subject = self.cmb_subject.currentData() or "—"
+        self.setWindowTitle(f"{subject} EMG 原始信号 / ISEK 包络 对比")
+
+    # ── 交互回调 ──────────────────────────────────────
+    def _on_subject_changed(self):
+        self._update_title()
+        self._reload_conditions()
+        self._load_trials()
+
     def _on_cond_changed(self):
         self._load_trials()
 
     def _on_trial_changed(self):
+        subject = self.cmb_subject.currentData()
         cond = self.cmb_cond.currentData()
         fname = self.cmb_trial.currentData()
-        if not cond or not fname:
+        if not subject or not cond or not fname:
             return
 
-        raw_path = DATA_DIR / cond / "emg" / fname
-        env_path = DATA_DIR / cond / "emg_envelope" / fname
+        raw_path = self.dataset.trial_path(subject, cond, "emg", fname)
+        env_path = self.dataset.trial_path(subject, cond, "emg_envelope", fname)
         if not raw_path.exists():
             return
 
@@ -306,10 +366,18 @@ class EMGEnvelopeViewer(QMainWindow):
                 curve.setVisible(visible)
 
 
-def main():
-    app = QApplication(sys.argv)
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Georgia Tech 数据集 EMG 原始信号 / ISEK 包络 对比")
+    add_data_args(parser)
+    args = parser.parse_args(argv)
+
+    dataset = resolve_dataset(args)
+
+    app = QApplication(sys.argv[:1])
     app.setStyle("Fusion")
-    viewer = EMGEnvelopeViewer()
+    viewer = EMGEnvelopeViewer(dataset, subject=args.subject,
+                               condition=args.condition, trial=args.trial)
     viewer.show()
     sys.exit(app.exec())
 
